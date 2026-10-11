@@ -12,11 +12,19 @@ import unittest
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AGENT = os.path.join(ROOT, "avr-volume-agent")
+AGENT = os.path.join(ROOT, "target", "debug", "avr-volume-agent")
 
 
 class DenonHandler(socketserver.StreamRequestHandler):
+    def _reply(self, payload):
+        try:
+            self.request.sendall(payload)
+            return True
+        except OSError:
+            return False
+
     def handle(self):
+        self.server.register_client(self.request)
         data = bytearray()
         while True:
             chunk = self.request.recv(256)
@@ -31,13 +39,19 @@ class DenonHandler(socketserver.StreamRequestHandler):
                     continue
                 self.server.commands.append_lock(line)
                 if line == "MV?":
-                    self.request.sendall(b"MV44\rMVMAX 72\r")
+                    if not self._reply(b"MV44\rMVMAX 72\r"):
+                        return
                 elif line == "MU?":
-                    self.request.sendall(b"MUOFF\r")
+                    if not self._reply(b"MUOFF\r"):
+                        return
                 elif line.startswith("MV") and line[2:].isdigit():
-                    self.request.sendall((line + "\r").encode("ascii"))
+                    if self.server.reply_delay:
+                        time.sleep(self.server.reply_delay)
+                    if not self._reply((line + "\r").encode("ascii")):
+                        return
                 elif line in ("MUON", "MUOFF"):
-                    self.request.sendall((line + "\r").encode("ascii"))
+                    if not self._reply((line + "\r").encode("ascii")):
+                        return
 
 
 class LockedCommands(list):
@@ -58,11 +72,28 @@ class MockDenonServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self):
+    def __init__(self, reply_delay=0):
         super().__init__(("127.0.0.1", 0), DenonHandler)
         self.commands = LockedCommands()
+        self.reply_delay = reply_delay
+        self.clients = set()
+        self.clients_lock = threading.Lock()
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
+
+    def register_client(self, client):
+        with self.clients_lock:
+            self.clients.add(client)
+
+    def push_status(self, payload):
+        with self.clients_lock:
+            clients = tuple(self.clients)
+        for client in clients:
+            try:
+                client.sendall(payload)
+            except OSError:
+                with self.clients_lock:
+                    self.clients.discard(client)
 
     def close(self):
         self.shutdown()
@@ -138,9 +169,9 @@ def monitor_rms(source, sink):
 class PipeWireIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        required = ("pactl", "pw-link", "wpctl", "parec", "paplay")
+        required = ("pactl", "wpctl", "parec", "paplay")
         if not os.path.isfile(AGENT):
-            raise unittest.SkipTest("build avr-volume-agent first with `make`")
+            raise unittest.SkipTest("build avr-volume-agent first with `cargo build`")
         if any(shutil.which(tool) is None for tool in required):
             raise unittest.SkipTest("PipeWire Pulse tools are not installed")
         try:
@@ -213,10 +244,11 @@ class PipeWireIntegrationTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: "MV?" in self.avr.commands.snapshot()))
         self.assertTrue(wait_until(lambda: "MU?" in self.avr.commands.snapshot()))
         time.sleep(1.1)
+        startup_commands = self.avr.commands.snapshot()
         self.assertFalse(
             any(command.startswith("MV") and command != "MV?"
-                for command in self.avr.commands.snapshot()),
-            "startup restored volume must not overwrite the AVR's current setting",
+                for command in startup_commands),
+            f"startup restored volume must not overwrite the AVR's current setting: {startup_commands}",
         )
 
         self._set_slider(10)
@@ -233,6 +265,59 @@ class PipeWireIntegrationTest(unittest.TestCase):
         self.assertGreater(low_volume_rms, 1000)
         self.assertAlmostEqual(low_volume_rms, full_volume_rms, delta=full_volume_rms * 0.05)
         self.assertAlmostEqual(low_volume_rms, muted_rms, delta=low_volume_rms * 0.05)
+
+    def test_rapid_slider_changes_ignore_stale_avr_replies(self):
+        self.avr.reply_delay = 0.25
+        self.assertTrue(wait_until(lambda: "MV?" in self.avr.commands.snapshot()))
+        time.sleep(2.1)
+
+        pactl("set-sink-volume", self.node_name, "10%")
+        self._wait_command("MV07")
+        pactl("set-sink-volume", self.node_name, "50%")
+        pactl("set-sink-volume", self.node_name, "30%")
+
+        samples = []
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            current = sink_info(self.node_name)
+            percent = int(current["volume"]["front-left"]["value_percent"].rstrip("%"))
+            samples.append(percent)
+            commands = self.avr.commands.snapshot()
+            if commands.count("MV22") and 29 <= percent <= 32:
+                time.sleep(0.6)
+                current = sink_info(self.node_name)
+                percent = int(current["volume"]["front-left"]["value_percent"].rstrip("%"))
+                samples.append(percent)
+                if 29 <= percent <= 32:
+                    break
+            time.sleep(0.05)
+
+        self.assertIn("MV22", self.avr.commands.snapshot())
+        self.assertTrue(samples, "no volume samples were collected")
+        self.assertGreaterEqual(min(samples), 29, f"volume bounced to an obsolete value: {samples}")
+
+    def test_receiver_volume_updates_desktop_without_echoing_back(self):
+        self.assertTrue(wait_until(lambda: "MV?" in self.avr.commands.snapshot()))
+        time.sleep(1.1)
+        command_count = len(self.avr.commands.snapshot())
+
+        self.avr.push_status(b"MV50\r")
+
+        # The AVR code maps to cubic gain; Pulse reports that gain perceptually.
+        self.assertTrue(wait_until(lambda: 67 <= int(
+            sink_info(self.node_name)["volume"]["front-left"]["value_percent"].rstrip("%")
+        ) <= 71))
+        new_commands = self.avr.commands.snapshot()[command_count:]
+        self.assertFalse(
+            any(command.startswith("MV") and command != "MV?" for command in new_commands),
+            f"external AVR volume was echoed back as a command: {new_commands}",
+        )
+
+        command_count = len(self.avr.commands.snapshot())
+        self.avr.push_status(b"MUON\r")
+        self.assertTrue(wait_until(lambda: sink_info(self.node_name)["mute"]))
+        new_commands = self.avr.commands.snapshot()[command_count:]
+        self.assertNotIn("MUON", new_commands, f"external AVR mute was echoed: {new_commands}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,59 @@
+# Local-checkout PKGBUILD. Replace url/source before publishing to the AUR.
+pkgname=avr-volume-agent
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Denon AVR volume and mute control for PipeWire"
+arch=('x86_64')
+url='https://example.invalid/avr-volume-agent'
+license=('MIT')
+depends=('libpipewire' 'libpulse' 'pipewire-pulse')
+makedepends=('cargo' 'clang' 'pkgconf')
+# libspa-sys' generated static C wrappers fail to link when Arch LTO is enabled.
+options=('!lto')
+source=()
+b2sums=()
+
+prepare() {
+	local _project_root="$startdir/../.."
+	if [[ ! -f "$_project_root/Cargo.toml" ]]; then
+		printf 'PKGBUILD must be run from packaging/arch inside the source checkout\n' >&2
+		return 1
+	fi
+
+	mkdir -p "$srcdir/$pkgname"
+	cp -a \
+		"$_project_root/Cargo.toml" \
+		"$_project_root/Cargo.lock" \
+		"$_project_root/LICENSE" \
+		"$_project_root/src" \
+		"$_project_root/systemd" \
+		"$srcdir/$pkgname/"
+
+	cd "$srcdir/$pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target x86_64-unknown-linux-gnu
+}
+
+build() {
+	cd "$srcdir/$pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release
+}
+
+check() {
+	cd "$srcdir/$pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo test --frozen
+}
+
+package() {
+	cd "$srcdir/$pkgname"
+	install -Dm755 "target/release/$pkgname" \
+		"$pkgdir/usr/bin/$pkgname"
+	install -Dm644 systemd/avr-volume-agent.service \
+		"$pkgdir/usr/lib/systemd/user/avr-volume-agent.service"
+	install -Dm644 LICENSE \
+		"$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

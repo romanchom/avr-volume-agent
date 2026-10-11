@@ -1,0 +1,28 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install PipeWire build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang libclang-dev libpipewire-0.3-dev pkg-config
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Run unit tests
+        run: cargo test --locked
+      - name: Verify local Cargo installation
+        run: cargo install --path . --locked --root "$RUNNER_TEMP/avr-volume-agent-install"

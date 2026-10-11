@@ -1,0 +1,19 @@
+[package]
+name = "avr-volume-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "PipeWire volume and mute control for Denon AV receivers"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+pipewire = "0.10.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"

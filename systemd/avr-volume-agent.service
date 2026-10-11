@@ -1,0 +1,14 @@
+[Unit]
+Description=Denon AVR volume control over PipeWire
+After=pipewire.service wireplumber.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/avr-volume-agent
+Restart=on-failure
+RestartSec=2s
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
