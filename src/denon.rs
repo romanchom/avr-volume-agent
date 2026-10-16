@@ -1,10 +1,17 @@
+//! Converts Denon's text protocol to/from the receiver's numeric volume codes.
+//! PipeWire volume values are linear amplitudes, so the perceptual slider mapping
+//! lives here rather than leaking scale conversions into the network worker.
+
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ReceiverStatus {
+    /// Receiver-reported command ceiling; do not assume the global protocol maximum applies.
     pub max_code: f64,
+    /// Denon volume code in half-step or integer wire units, not linear gain.
     pub volume_code: f64,
     pub muted: bool,
+    /// Fields observed so far on this connection, used to handle partial startup reports.
     pub seen: StatusFields,
 }
 
@@ -63,6 +70,8 @@ fn parse_denon_code(value: &str, max: f64) -> Option<f64> {
         return None;
     }
 
+    // Denon uses three digits for half-step values; normalizing here keeps the
+    // rest of the state machine on a single numeric scale.
     let parsed = u16::from_str(value).ok()?;
     let code = match value.len() {
         1..=2 if parsed <= max as u16 => f64::from(parsed),
@@ -77,6 +86,8 @@ pub fn slider_to_code(channel_volume: f32, max_code: f64) -> i32 {
     if max_code <= 0.0 {
         return 0;
     }
+    // Convert linear PipeWire gain to the AVR slider's cubic control scale only
+    // at the boundary; the audio buffers themselves are never scaled here.
     let volume = channel_volume.clamp(0.0, 1.0);
     ((volume.cbrt() as f64 * max_code).round() as i32).clamp(0, max_code.floor() as i32)
 }

@@ -1,7 +1,7 @@
 # Local-checkout PKGBUILD. Replace url/source before publishing to the AUR.
 pkgname=avr-volume-agent
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Denon AVR volume and mute control for PipeWire"
 arch=('x86_64')
 url='https://example.invalid/avr-volume-agent'

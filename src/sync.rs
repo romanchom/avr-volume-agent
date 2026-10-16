@@ -1,11 +1,18 @@
+//! Reconciles local PipeWire intent with asynchronous receiver status.
+//! AVR status messages have no request IDs, so an expected value and a short
+//! deadline are used to distinguish a command echo from an older report.
+
 use std::time::{Duration, Instant};
 
 use crate::denon::{ReceiverStatus, StatusFields};
 
+// The AVR has no transaction IDs; after this window a queried report is treated
+// as external/current state instead of waiting forever for a lost echo.
 const PENDING_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AcceptedStatus {
+    /// Receiver volume that is safe to publish to PipeWire after echo filtering.
     pub volume_code: Option<f64>,
     pub muted: Option<bool>,
 }

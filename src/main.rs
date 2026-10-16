@@ -29,7 +29,7 @@ struct Args {
     #[arg(long)]
     no_network: bool,
 
-    /// Do not send volume or mute commands to the AVR
+    /// Keep AVR status synchronization, but do not send volume or mute commands
     #[arg(long)]
     read_only: bool,
 }
@@ -68,6 +68,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn default_target_sink() -> Result<String, Box<dyn std::error::Error>> {
+    // Resolve the default once; graph discovery/linking itself uses PipeWire's registry.
     let output = Command::new("pactl")
         .args(["get-default-sink"])
         .stdin(Stdio::null())

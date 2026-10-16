@@ -1,4 +1,11 @@
-use std::cell::{RefCell, UnsafeCell};
+//! PipeWire graph, virtual sink, and AVR-facing control properties.
+//!
+//! The target sink determines the virtual sink's channel map and startup sample
+//! rate. Raw `pw_filter` FFI stays in this module because the Rust crate has no
+//! safe filter wrapper. Its RT callback only copies buffers; control and graph
+//! work stays on the PipeWire loop.
+
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io;
@@ -10,27 +17,188 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use pipewire as pw;
-use pipewire::loop_::Signal;
+use pipewire::loop_::{Signal, Timeout};
 use pipewire::properties::PropertiesBox;
 use pipewire::spa::pod::builder::Builder;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::denon::{self, ReceiverStatus, StatusFields};
 use crate::network::{self, NetworkCommand, NetworkConfig, NetworkEvent};
 use crate::sync::Reconciler;
 
-const CHANNELS: usize = 6;
-const RATE: i32 = 48_000;
-const CHANNEL_NAMES: [&str; CHANNELS] = ["FL", "FR", "RL", "RR", "FC", "LFE"];
-const CHANNEL_IDS: [u32; CHANNELS] = [
-    pw::spa::sys::SPA_AUDIO_CHANNEL_FL,
-    pw::spa::sys::SPA_AUDIO_CHANNEL_FR,
-    pw::spa::sys::SPA_AUDIO_CHANNEL_RL,
-    pw::spa::sys::SPA_AUDIO_CHANNEL_RR,
-    pw::spa::sys::SPA_AUDIO_CHANNEL_FC,
-    pw::spa::sys::SPA_AUDIO_CHANNEL_LFE,
-];
+const REGISTRY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const LAYOUT_CHANGE_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const PROP_HARDWARE: u32 = pw::spa::sys::SPA_POD_PROP_FLAG_HARDWARE;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Channel {
+    name: &'static str,
+    id: u32,
+}
+
+// Registry globals are unordered, so this table is both the exact SPA label map
+// and the deterministic order used to advertise the virtual sink.
+const SUPPORTED_CHANNELS: [Channel; 36] = [
+    Channel {
+        name: "MONO",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_MONO,
+    },
+    Channel {
+        name: "FL",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FL,
+    },
+    Channel {
+        name: "FR",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FR,
+    },
+    Channel {
+        name: "RL",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_RL,
+    },
+    Channel {
+        name: "RR",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_RR,
+    },
+    Channel {
+        name: "FC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FC,
+    },
+    Channel {
+        name: "LFE",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_LFE,
+    },
+    Channel {
+        name: "SL",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_SL,
+    },
+    Channel {
+        name: "SR",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_SR,
+    },
+    Channel {
+        name: "FLC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FLC,
+    },
+    Channel {
+        name: "FRC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FRC,
+    },
+    Channel {
+        name: "RC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_RC,
+    },
+    Channel {
+        name: "TC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TC,
+    },
+    Channel {
+        name: "TFL",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TFL,
+    },
+    Channel {
+        name: "TFC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TFC,
+    },
+    Channel {
+        name: "TFR",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TFR,
+    },
+    Channel {
+        name: "TRL",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TRL,
+    },
+    Channel {
+        name: "TRC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TRC,
+    },
+    Channel {
+        name: "TRR",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TRR,
+    },
+    Channel {
+        name: "RLC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_RLC,
+    },
+    Channel {
+        name: "RRC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_RRC,
+    },
+    Channel {
+        name: "FLW",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FLW,
+    },
+    Channel {
+        name: "FRW",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FRW,
+    },
+    Channel {
+        name: "LFE2",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_LFE2,
+    },
+    Channel {
+        name: "FLH",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FLH,
+    },
+    Channel {
+        name: "FCH",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FCH,
+    },
+    Channel {
+        name: "FRH",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_FRH,
+    },
+    Channel {
+        name: "TFLC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TFLC,
+    },
+    Channel {
+        name: "TFRC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TFRC,
+    },
+    Channel {
+        name: "TSL",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TSL,
+    },
+    Channel {
+        name: "TSR",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_TSR,
+    },
+    Channel {
+        name: "LLFE",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_LLFE,
+    },
+    Channel {
+        name: "RLFE",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_RLFE,
+    },
+    Channel {
+        name: "BC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_BC,
+    },
+    Channel {
+        name: "BLC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_BLC,
+    },
+    Channel {
+        name: "BRC",
+        id: pw::spa::sys::SPA_AUDIO_CHANNEL_BRC,
+    },
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChannelLayout {
+    channels: Vec<Channel>,
+}
+
+impl ChannelLayout {
+    fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.channels.iter().map(|channel| channel.name)
+    }
+
+    fn ids(&self) -> Vec<u32> {
+        self.channels.iter().map(|channel| channel.id).collect()
+    }
+}
 
 /// Configuration for the PipeWire virtual sink and its AVR control endpoint.
 #[derive(Clone, Debug)]
@@ -45,11 +213,15 @@ pub struct PipeWireConfig {
 
 struct Runtime {
     filter: *mut pw::sys::pw_filter,
+    // Built before filter activation and never resized: the RT callback reads
+    // these port handles without taking a lock.
     rt: RtPorts,
+    // PipeWire control callbacks mutate this separately from the immutable RT ports.
     control: UnsafeCell<ControlState>,
 }
 
 struct ControlState {
+    layout: ChannelLayout,
     volume: f32,
     muted: bool,
     write_enabled: bool,
@@ -65,8 +237,8 @@ struct ControlState {
 }
 
 struct RtPorts {
-    input: [*mut std::ffi::c_void; CHANNELS],
-    output: [*mut std::ffi::c_void; CHANNELS],
+    input: Vec<*mut std::ffi::c_void>,
+    output: Vec<*mut std::ffi::c_void>,
 }
 
 struct PortData {
@@ -74,13 +246,18 @@ struct PortData {
 }
 
 struct RegistryState {
+    // This state is confined to the PipeWire loop and is not shared with RT audio processing.
     core: *mut pw::sys::pw_core,
     target_sink: String,
+    target_global: Option<pw::registry::GlobalObject<PropertiesBox>>,
     node_name: String,
     nodes: HashMap<u32, String>,
     ports: HashMap<u32, PortInfo>,
     link_proxies: HashMap<(u32, u32), *mut pw::sys::pw_proxy>,
     link_globals: HashMap<u32, (u32, u32)>,
+    layout: Option<ChannelLayout>,
+    layout_check_at: Option<Instant>,
+    layout_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -93,6 +270,16 @@ struct PortInfo {
 struct NetworkWorkerGuard {
     sender: Option<mpsc::Sender<NetworkCommand>>,
     worker: Option<JoinHandle<()>>,
+}
+
+// The enum request uses a client sequence, but PipeWire reports its allocated AsyncSeq.
+const CURRENT_FORMAT_QUERY_SEQ: i32 = 1;
+
+struct SampleRateQuery {
+    // Prefer Format when the node is active; properties cover suspended targets.
+    active_format: Option<i32>,
+    node_property: Option<i32>,
+    listener: Option<pw::node::NodeListener>,
 }
 
 impl Drop for NetworkWorkerGuard {
@@ -131,6 +318,171 @@ impl Drop for RegistryState {
     }
 }
 
+fn discover_target_layout(state: &RegistryState) -> Result<Option<ChannelLayout>, String> {
+    let target_nodes: Vec<u32> = state
+        .nodes
+        .iter()
+        .filter_map(|(id, name)| (name == &state.target_sink).then_some(*id))
+        .collect();
+    if target_nodes.is_empty() {
+        return Ok(None);
+    }
+    if target_nodes.len() > 1 {
+        return Err(format!(
+            "multiple nodes are named '{}', so its input ports are ambiguous",
+            state.target_sink
+        ));
+    }
+
+    let target_node = target_nodes[0];
+    let mut channels = Vec::new();
+    for port in state
+        .ports
+        .values()
+        .filter(|port| port.node_id == target_node && port.direction == "in")
+    {
+        let channel = SUPPORTED_CHANNELS
+            .iter()
+            .find(|channel| channel.name == port.channel)
+            .copied()
+            .ok_or_else(|| format!("unsupported audio.channel label '{}'", port.channel))?;
+        if channels
+            .iter()
+            .any(|present: &Channel| present.name == channel.name)
+        {
+            return Err(format!(
+                "duplicate audio.channel label '{}' on target input ports",
+                channel.name
+            ));
+        }
+        channels.push(channel);
+    }
+    if channels.is_empty() {
+        return Ok(None);
+    }
+
+    // SPA channel order is explicit so registry HashMap iteration cannot affect the layout.
+    channels.sort_by_key(|channel| {
+        SUPPORTED_CHANNELS
+            .iter()
+            .position(|supported| supported.name == channel.name)
+            .expect("channels were mapped from SUPPORTED_CHANNELS")
+    });
+    Ok(Some(ChannelLayout { channels }))
+}
+
+fn query_active_sample_rate(
+    core: &pw::core::CoreBox<'_>,
+    mainloop: &pw::main_loop::MainLoopBox,
+    target_node: &pw::node::Node,
+) -> Result<SampleRateQuery, Box<dyn Error>> {
+    // Active Format is preferred over the node property because it reflects the
+    // negotiated rate; suspended nodes still report a configured audio.rate below.
+    debug!("bound target node for active sample-rate query");
+    let active_sample_rate = Rc::new(Cell::new(None));
+    let active_rate_callback = Rc::clone(&active_sample_rate);
+    let node_sample_rate = Rc::new(Cell::new(None));
+    let node_rate_callback = Rc::clone(&node_sample_rate);
+    let _node_listener = target_node
+        .add_listener_local()
+        .info(move |info| {
+            let rate = info
+                .props()
+                .and_then(|props| props.get("audio.rate"))
+                .and_then(|rate| rate.parse::<i32>().ok())
+                .filter(|rate| *rate > 0);
+            if let Some(rate) = rate {
+                debug!(rate, "read target sample rate from node properties");
+                node_rate_callback.set(Some(rate));
+            }
+        })
+        .param(move |seq, param_type, _index, _next, param| {
+            // Do not compare seq with CURRENT_FORMAT_QUERY_SEQ; PipeWire allocates an AsyncSeq.
+            debug!(?seq, ?param_type, "received target node format parameter");
+            if param_type != pw::spa::param::ParamType::Format {
+                return;
+            }
+            let Some(param) = param else {
+                return;
+            };
+            let Ok((media_type, _media_subtype)) =
+                pw::spa::param::format_utils::parse_format(param)
+            else {
+                return;
+            };
+            if media_type != pw::spa::param::format::MediaType::Audio {
+                return;
+            }
+
+            let rate = param
+                .as_object()
+                .ok()
+                .and_then(|object| {
+                    object.find_prop(pw::spa::utils::Id(pw::spa::sys::SPA_FORMAT_AUDIO_rate))
+                })
+                .and_then(|property| property.value().get_int().ok())
+                .filter(|rate| *rate > 0);
+            if let Some(rate) = rate {
+                debug!(rate, "parsed active target sample rate");
+                active_rate_callback.set(Some(rate));
+            }
+        })
+        .register();
+
+    // Format is the current negotiated POD. EnumFormat only advertises possible
+    // rates and can select a different rate from the one used by the sink.
+    debug!("requesting target node active Format");
+    target_node.enum_params(
+        CURRENT_FORMAT_QUERY_SEQ,
+        Some(pw::spa::param::ParamType::Format),
+        0,
+        1,
+    );
+    // This barrier ensures the node's current-format response is delivered
+    // before deciding whether a rate was available.
+    let sync_seq = core.sync(0)?;
+    debug!(?sync_seq, "requested sample-rate query barrier");
+    let sync_complete = Rc::new(Cell::new(false));
+    let sync_complete_callback = Rc::clone(&sync_complete);
+    let _core_listener = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id == pw::core::PW_ID_CORE && seq == sync_seq {
+                sync_complete_callback.set(true);
+            }
+        })
+        .register();
+
+    let deadline = Instant::now() + REGISTRY_DISCOVERY_TIMEOUT;
+    while !sync_complete.get() && Instant::now() < deadline {
+        let result = mainloop
+            .loop_()
+            .iterate(Timeout::Finite(Duration::from_millis(50)));
+        if result < 0 {
+            return Err(io::Error::other(format!(
+                "PipeWire loop failed while querying active format: {}",
+                io::Error::from_raw_os_error(-result)
+            ))
+            .into());
+        }
+    }
+    debug!(
+        sync_complete = sync_complete.get(),
+        "completed sample-rate query wait"
+    );
+    if !sync_complete.get() {
+        debug!("timed out querying target sink active Format");
+    }
+    let active_rate = active_sample_rate.get();
+    let node_rate = node_sample_rate.get();
+    debug!(?active_rate, ?node_rate, "target sample-rate query results");
+    Ok(SampleRateQuery {
+        active_format: active_rate,
+        node_property: node_rate,
+        listener: Some(_node_listener),
+    })
+}
+
 /// Run the PipeWire main loop until SIGINT or SIGTERM, then stop AVR I/O.
 pub fn run(config: PipeWireConfig) -> Result<(), Box<dyn Error>> {
     if config.node_name == config.target_sink {
@@ -154,10 +506,13 @@ pub fn run(config: PipeWireConfig) -> Result<(), Box<dyn Error>> {
     let mut runtime = Box::new(Runtime {
         filter: ptr::null_mut(),
         rt: RtPorts {
-            input: [ptr::null_mut(); CHANNELS],
-            output: [ptr::null_mut(); CHANNELS],
+            input: Vec::new(),
+            output: Vec::new(),
         },
         control: UnsafeCell::new(ControlState {
+            layout: ChannelLayout {
+                channels: Vec::new(),
+            },
             volume: 0.216,
             muted: false,
             write_enabled: config.write_enabled,
@@ -207,16 +562,18 @@ fn run_pipewire(
         sender: runtime.control.get_mut().network_commands.clone(),
         worker: network_worker,
     };
-    create_filter(&config, mainloop.loop_().as_raw_ptr(), &mut runtime)?;
-
     let registry_state = Rc::new(RefCell::new(RegistryState {
         core: core.as_raw_ptr(),
         target_sink: config.target_sink.clone(),
+        target_global: None,
         node_name: config.node_name.clone(),
         nodes: HashMap::new(),
         ports: HashMap::new(),
         link_proxies: HashMap::new(),
         link_globals: HashMap::new(),
+        layout: None,
+        layout_check_at: None,
+        layout_error: None,
     }));
     let state_for_global = Rc::clone(&registry_state);
     let core_ptr = core.as_raw_ptr() as usize;
@@ -229,10 +586,17 @@ fn run_pipewire(
             };
             let object_type = global.type_.to_str();
             let mut state = state_for_global.borrow_mut();
+            let layout_relevant = matches!(
+                object_type,
+                "PipeWire:Interface:Node" | "PipeWire:Interface:Port"
+            );
             match object_type {
                 "PipeWire:Interface:Node" => {
                     if let Some(name) = props.get("node.name") {
                         state.nodes.insert(global.id, name.to_owned());
+                        if name == state.target_sink {
+                            state.target_global = Some(global.to_owned());
+                        }
                     }
                 }
                 "PipeWire:Interface:Port" => {
@@ -276,13 +640,25 @@ fn run_pipewire(
                 }
                 _ => return,
             }
-            reconcile_links(&mut state, core_ptr as *mut pw::sys::pw_core);
+            if layout_relevant && state.layout.is_some() {
+                state.layout_check_at = Some(Instant::now() + LAYOUT_CHANGE_QUIET_PERIOD);
+            }
+            if state.layout_error.is_none() {
+                reconcile_links(&mut state, core_ptr as *mut pw::sys::pw_core);
+            }
         })
         .global_remove({
             let state = Rc::clone(&registry_state);
             move |id| {
                 let mut state = state.borrow_mut();
                 state.nodes.remove(&id);
+                if state
+                    .target_global
+                    .as_ref()
+                    .is_some_and(|target| target.id == id)
+                {
+                    state.target_global = None;
+                }
                 state.ports.remove(&id);
                 if let Some(pair) = state.link_globals.remove(&id) {
                     if let Some(proxy) = state.link_proxies.remove(&pair) {
@@ -292,18 +668,198 @@ fn run_pipewire(
                         }
                     }
                 }
-                reconcile_links(&mut state, core_ptr as *mut pw::sys::pw_core);
+                if state.layout.is_some() {
+                    state.layout_check_at = Some(Instant::now() + LAYOUT_CHANGE_QUIET_PERIOD);
+                }
+                if state.layout_error.is_none() {
+                    reconcile_links(&mut state, core_ptr as *mut pw::sys::pw_core);
+                }
             }
         })
         .register();
 
+    // One round trip makes the initial node/port snapshot complete before the
+    // target layout is treated as authoritative.
     let sync_seq = core.sync(0)?;
     debug!(?sync_seq, "requested initial PipeWire registry sync");
+    let sync_complete = Rc::new(Cell::new(false));
+    let sync_complete_callback = Rc::clone(&sync_complete);
+    let _core_listener = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id == pw::core::PW_ID_CORE && seq == sync_seq {
+                sync_complete_callback.set(true);
+            }
+        })
+        .register();
+
+    let sync_deadline = Instant::now() + REGISTRY_DISCOVERY_TIMEOUT;
+    while !sync_complete.get() && Instant::now() < sync_deadline {
+        mainloop
+            .loop_()
+            .iterate(Timeout::Finite(Duration::from_millis(50)));
+    }
+    if !sync_complete.get() {
+        return Err(io::Error::other(format!(
+            "timed out syncing PipeWire registry while discovering target sink '{}'",
+            config.target_sink
+        ))
+        .into());
+    }
+    debug!("initial PipeWire registry sync completed");
+
+    // Creating the filter before the target is known would hard-code a fallback
+    // layout and force PipeWire to resample/relink from an invented channel map.
+    // The filter's channel ports and sample format are immutable once active;
+    // wait for the named target instead of inventing a fallback layout.
+    let discovery_deadline = Instant::now() + REGISTRY_DISCOVERY_TIMEOUT;
+    let layout = loop {
+        let discovered = {
+            let state = registry_state.borrow();
+            discover_target_layout(&state)
+        };
+        match discovered {
+            Ok(Some(layout)) => {
+                debug!(
+                    target = %config.target_sink,
+                    channels = ?layout.names().collect::<Vec<_>>(),
+                    "discovered target channel layout"
+                );
+                break layout;
+            }
+            Ok(None) if Instant::now() < discovery_deadline => {
+                mainloop
+                    .loop_()
+                    .iterate(Timeout::Finite(Duration::from_millis(50)));
+            }
+            Ok(None) => {
+                return Err(io::Error::other(format!(
+                    "target PipeWire sink '{}' was not found or exposed no input audio ports within {} seconds",
+                    config.target_sink,
+                    REGISTRY_DISCOVERY_TIMEOUT.as_secs()
+                ))
+                .into());
+            }
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "invalid channel layout for target PipeWire sink '{}': {error}",
+                    config.target_sink
+                ))
+                .into());
+            }
+        }
+    };
+    let (target_global, configured_sample_rate) = {
+        let state = registry_state.borrow();
+        let target = state.target_global.as_ref().ok_or_else(|| {
+            io::Error::other(format!(
+                "target sink '{}' disappeared before its active format could be queried",
+                config.target_sink
+            ))
+        })?;
+        // The global may carry an explicit rate even when a suspended node has
+        // no current Format parameter yet.
+        let configured_rate = target
+            .props
+            .as_ref()
+            .and_then(|props| props.get("audio.rate"))
+            .and_then(|rate| rate.parse::<i32>().ok())
+            .filter(|rate| *rate > 0);
+        (target.to_owned(), configured_rate)
+    };
+    // Keep the proxy/listener alive through the main loop; their events and
+    // teardown belong to this PipeWire connection's loop lifetime.
+    let mut _target_node_for_runtime = None;
+    let mut _target_node_listener_for_runtime = None;
+    let active_sample_rate = match registry.bind::<pw::node::Node, _>(&target_global) {
+        Ok(target_node) => {
+            let query_result = query_active_sample_rate(core, mainloop, &target_node);
+            _target_node_for_runtime = Some(target_node);
+            match query_result {
+                Ok(query) => {
+                    _target_node_listener_for_runtime = query.listener;
+                    query.active_format.or(query.node_property)
+                }
+                Err(error) => {
+                    warn!(%error, "could not query target's active sample rate");
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            warn!(%error, "could not bind target node to query its sample rate");
+            None
+        }
+    };
+    // Never invent a 48 kHz fallback: a mismatched format can fail to link or
+    // silently resample in a way that hides the target's actual configuration.
+    debug!(
+        ?active_sample_rate,
+        ?configured_sample_rate,
+        "resolving target sample rate"
+    );
+    let sample_rate = active_sample_rate.or(configured_sample_rate)
+        .ok_or_else(|| {
+        io::Error::other(format!(
+            "target sink '{}' exposes neither an active audio Format rate nor a valid audio.rate property",
+            config.target_sink
+        ))
+    })?;
+    debug!(
+        target = %config.target_sink,
+        sample_rate,
+        "discovered target active sample rate"
+    );
+    registry_state.borrow_mut().layout = Some(layout.clone());
+    runtime.control.get_mut().layout = layout.clone();
+    create_filter(
+        &config,
+        mainloop.loop_().as_raw_ptr(),
+        &mut runtime,
+        &layout,
+        sample_rate,
+    )?;
+    info!(
+        target = %config.target_sink,
+        sample_rate,
+        channels = layout.channels.len(),
+        "created virtual sink using target audio format"
+    );
+    reconcile_links(&mut registry_state.borrow_mut(), core.as_raw_ptr());
 
     let runtime_ptr = (&mut *runtime) as *mut Runtime as usize;
+    let loop_ptr = mainloop.as_raw_ptr() as usize;
+    let state_for_timer = Rc::clone(&registry_state);
     let timer = mainloop.loop_().add_timer(move |_| {
         // This timer is dispatched by the PipeWire main loop, never by the RT process thread.
         unsafe { poll_network_events(runtime_ptr as *mut Runtime) };
+        let mut state = state_for_timer.borrow_mut();
+        if state
+            .layout_check_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            state.layout_check_at = None;
+            match discover_target_layout(&state) {
+                Ok(Some(layout)) if state.layout.as_ref() != Some(&layout) => {
+                    state.layout_error = Some(format!(
+                        "target sink '{}' returned with a different channel layout; restarting is required",
+                        state.target_sink
+                    ));
+                }
+                Err(error) => {
+                    state.layout_error = Some(format!(
+                        "target sink '{}' returned with an invalid channel layout: {error}",
+                        state.target_sink
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(error) = state.layout_error.as_deref() {
+            warn!(%error, "stopping PipeWire filter after target layout change");
+            // SAFETY: this timer runs on the live main loop and the pointer is its owner.
+            unsafe { pw::sys::pw_main_loop_quit(loop_ptr as *mut pw::sys::pw_main_loop) };
+        }
     });
     timer
         .update_timer(
@@ -312,7 +868,6 @@ fn run_pipewire(
         )
         .into_sync_result()?;
 
-    let loop_ptr = mainloop.as_raw_ptr() as usize;
     let _sigint = mainloop.loop_().add_signal_local(Signal::INT, move || {
         // SAFETY: the signal source is owned by this live main loop and runs on its loop thread.
         unsafe {
@@ -338,6 +893,9 @@ fn run_pipewire(
         pw::sys::pw_filter_destroy(runtime.filter);
     }
     runtime.filter = ptr::null_mut();
+    if let Some(error) = registry_state.borrow().layout_error.as_ref() {
+        return Err(io::Error::other(error.clone()).into());
+    }
     Ok(())
 }
 
@@ -345,7 +903,11 @@ fn create_filter(
     config: &PipeWireConfig,
     loop_ptr: *mut pw::sys::pw_loop,
     runtime: &mut Runtime,
+    layout: &ChannelLayout,
+    sample_rate: i32,
 ) -> Result<(), Box<dyn Error>> {
+    // The target's advertised positions become this sink's contract so clients
+    // feed exactly the channels that can be linked onward to the target.
     let mut props = PropertiesBox::new();
     props.insert("media.type", "Audio");
     props.insert("media.category", "Playback");
@@ -358,8 +920,11 @@ fn create_filter(
     props.insert("node.autoconnect", "true");
     props.insert("node.driver", "true");
     props.insert("priority.session", "2000");
-    props.insert("audio.channels", "6");
-    props.insert("audio.position", "[ FL, FR, RL, RR, FC, LFE ]");
+    props.insert("audio.channels", layout.channels.len().to_string());
+    props.insert(
+        "audio.position",
+        format!("[ {} ]", layout.names().collect::<Vec<_>>().join(", ")),
+    );
 
     static FILTER_EVENTS: pw::sys::pw_filter_events = pw::sys::pw_filter_events {
         version: pw::sys::PW_VERSION_FILTER_EVENTS,
@@ -390,15 +955,17 @@ fn create_filter(
     }
     runtime.filter = filter;
 
-    let mut port_format_buffers = Vec::with_capacity(CHANNELS);
-    for (channel, name) in CHANNEL_NAMES.iter().enumerate() {
-        port_format_buffers.push(build_format(1, &[CHANNEL_IDS[channel]])?);
+    runtime.rt.input = vec![ptr::null_mut(); layout.channels.len()];
+    runtime.rt.output = vec![ptr::null_mut(); layout.channels.len()];
+    let mut port_format_buffers = Vec::with_capacity(layout.channels.len());
+    for (channel, channel_layout) in layout.channels.iter().enumerate() {
+        port_format_buffers.push(build_format(sample_rate, 1, &[channel_layout.id])?);
         for (direction, is_input) in [("input", true), ("output", false)] {
             let mut props = PropertiesBox::new();
             props.insert("format.dsp", "32 bit float mono audio");
-            props.insert("port.name", format!("{direction}_{name}"));
+            props.insert("port.name", format!("{direction}_{}", channel_layout.name));
             props.insert("port.group", "playback");
-            props.insert("audio.channel", *name);
+            props.insert("audio.channel", channel_layout.name);
             let format = port_format_buffers
                 .last()
                 .expect("channel format was built");
@@ -433,9 +1000,10 @@ fn create_filter(
         }
     }
 
-    let format = build_format(CHANNELS as i32, &CHANNEL_IDS)?;
+    let channel_ids = layout.ids();
+    let format = build_format(sample_rate, layout.channels.len() as i32, &channel_ids)?;
     let control = runtime.control.get_mut();
-    let props = build_props(control.volume, control.muted)?;
+    let props = build_props(control.volume, control.muted, &control.layout)?;
     let volume_info = build_volume_info()?;
     let mute_info = build_mute_info()?;
     let mut params = [
@@ -480,7 +1048,9 @@ unsafe extern "C" fn process(
     if frames == 0 {
         return;
     }
-    for channel in 0..CHANNELS {
+    // Hardware Props control the AVR; applying their gain here would attenuate
+    // the copied signal a second time. This path deliberately remains unity gain.
+    for channel in 0..rt.input.len() {
         // SAFETY: the port handles are valid until filter destruction; get_dsp_buffer is RT-safe.
         let input = unsafe { pw::sys::pw_filter_get_dsp_buffer(rt.input[channel], frames as u32) }
             .cast::<f32>();
@@ -531,15 +1101,15 @@ unsafe extern "C" fn param_changed(
         pw::spa::sys::spa_pod_find_prop(param, ptr::null(), pw::spa::sys::SPA_PROP_channelVolumes)
     };
     if !volume_prop.is_null() {
-        let mut values = [0.0f32; CHANNELS];
-        // SAFETY: the property is an array of F32 values; the destination is sized for six values.
+        let mut values = vec![0.0f32; control.layout.channels.len()];
+        // SAFETY: the property is an array of F32 values; the destination matches the filter layout.
         let count = unsafe {
             pw::spa::sys::spa_pod_copy_array_full(
                 ptr::addr_of!((*volume_prop).value),
                 pw::spa::sys::SPA_TYPE_Float,
                 std::mem::size_of::<f32>() as u32,
                 values.as_mut_ptr().cast(),
-                CHANNELS as u32,
+                values.len() as u32,
             )
         };
         if count > 0 {
@@ -575,6 +1145,8 @@ unsafe extern "C" fn param_changed(
         return;
     }
     let now = Instant::now();
+    // Session managers may restore stale desktop Props at node creation. The
+    // initial AVR report is authoritative, so briefly suppress those restores.
     if control.ready {
         if control.restore_guard_until.is_some_and(|until| now < until)
             && control
@@ -640,6 +1212,8 @@ fn apply_network_event(
     control: &mut ControlState,
     event: NetworkEvent,
 ) {
+    // On first sync the AVR wins; after this guard window, later desktop changes
+    // become commands and unsolicited receiver changes update PipeWire Props.
     let first_status = !control.ready
         && event
             .status
@@ -693,7 +1267,7 @@ fn update_props(
     filter: *mut pw::sys::pw_filter,
     control: &ControlState,
 ) -> Result<(), Box<dyn Error>> {
-    let props = build_props(control.volume, control.muted)?;
+    let props = build_props(control.volume, control.muted, &control.layout)?;
     let mut params = [pod_ptr(&props)];
     // SAFETY: the filter is live on the PipeWire control loop and the POD remains valid for the call.
     let result = unsafe {
@@ -706,6 +1280,9 @@ fn update_props(
 }
 
 fn reconcile_links(state: &mut RegistryState, core: *mut pw::sys::pw_core) {
+    let Some(layout) = state.layout.as_ref() else {
+        return;
+    };
     let virtual_nodes: Vec<u32> = state
         .nodes
         .iter()
@@ -716,8 +1293,10 @@ fn reconcile_links(state: &mut RegistryState, core: *mut pw::sys::pw_core) {
         .iter()
         .filter_map(|(id, name)| (name == &state.target_sink).then_some(*id))
         .collect();
-    let mut desired = Vec::with_capacity(CHANNELS);
-    for channel in CHANNEL_NAMES {
+    // Global IDs can change across hotplug, while audio.channel labels express
+    // the stable relationship between each virtual output and target input.
+    let mut desired = Vec::with_capacity(layout.channels.len());
+    for channel in layout.names() {
         let output = state.ports.iter().find_map(|(id, port)| {
             (virtual_nodes.contains(&port.node_id)
                 && port.direction == "out"
@@ -782,6 +1361,8 @@ fn create_link(
     output_node: u32,
     input_node: u32,
 ) -> Result<*mut pw::sys::pw_proxy, Box<dyn Error>> {
+    // Use PipeWire's link factory rather than spawning pw-link, so link lifetime
+    // and hotplug reconciliation remain attached to this client/core.
     let mut props = PropertiesBox::new();
     props.insert("link.output.node", output_node.to_string());
     props.insert("link.output.port", output.to_string());
@@ -823,7 +1404,13 @@ fn destroy_link(core: *mut pw::sys::pw_core, proxy: *mut pw::sys::pw_proxy) {
     }
 }
 
-fn build_format(channels: i32, positions: &[u32]) -> Result<Vec<u8>, Box<dyn Error>> {
+fn build_format(
+    sample_rate: i32,
+    channels: i32,
+    positions: &[u32],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    // The filter remains F32 for simple RT copying; PipeWire converts at graph
+    // boundaries, while the sample rate matches the target's configured rate.
     let mut data = vec![0; 1024];
     let mut builder = Builder::new(&mut data);
     let mut frame = MaybeUninit::uninit();
@@ -842,7 +1429,7 @@ fn build_format(channels: i32, positions: &[u32]) -> Result<Vec<u8>, Box<dyn Err
     builder.add_prop(pw::spa::sys::SPA_FORMAT_AUDIO_format, 0)?;
     builder.add_id(pw::spa::utils::Id(pw::spa::sys::SPA_AUDIO_FORMAT_F32))?;
     builder.add_prop(pw::spa::sys::SPA_FORMAT_AUDIO_rate, 0)?;
-    builder.add_int(RATE)?;
+    builder.add_int(sample_rate)?;
     builder.add_prop(pw::spa::sys::SPA_FORMAT_AUDIO_channels, 0)?;
     builder.add_int(channels)?;
     builder.add_prop(pw::spa::sys::SPA_FORMAT_AUDIO_position, 0)?;
@@ -860,7 +1447,13 @@ fn build_format(channels: i32, positions: &[u32]) -> Result<Vec<u8>, Box<dyn Err
     Ok(data)
 }
 
-fn build_props(volume: f32, muted: bool) -> Result<Vec<u8>, Box<dyn Error>> {
+fn build_props(
+    volume: f32,
+    muted: bool,
+    layout: &ChannelLayout,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    // Volume/mute are hardware controls sent to the AVR. Keep software gain and
+    // mute neutral so the audio copied by `process` is not changed twice.
     let mut data = vec![0; 2048];
     let mut builder = Builder::new(&mut data);
     let mut frame = MaybeUninit::uninit();
@@ -872,26 +1465,27 @@ fn build_props(volume: f32, muted: bool) -> Result<Vec<u8>, Box<dyn Error>> {
             pw::spa::sys::SPA_PARAM_Props,
         )?
     };
-    let volumes = [volume; CHANNELS];
-    let soft_volumes = [1.0f32; CHANNELS];
+    let volumes = vec![volume; layout.channels.len()];
+    let soft_volumes = vec![1.0f32; layout.channels.len()];
     builder.add_prop(pw::spa::sys::SPA_PROP_channelVolumes, PROP_HARDWARE)?;
     // SAFETY: the arrays are contiguous F32 values whose lengths match the POD count.
     unsafe {
         builder.add_array(
             4,
             pw::spa::sys::SPA_TYPE_Float,
-            CHANNELS as u32,
+            volumes.len() as u32,
             volumes.as_ptr().cast(),
         )?;
     }
     builder.add_prop(pw::spa::sys::SPA_PROP_channelMap, 0)?;
+    let channel_ids = layout.ids();
     // SAFETY: channel ids are contiguous SPA Id values.
     unsafe {
         builder.add_array(
             4,
             pw::spa::sys::SPA_TYPE_Id,
-            CHANNELS as u32,
-            CHANNEL_IDS.as_ptr().cast(),
+            channel_ids.len() as u32,
+            channel_ids.as_ptr().cast(),
         )?;
     }
     builder.add_prop(pw::spa::sys::SPA_PROP_mute, PROP_HARDWARE)?;
@@ -899,12 +1493,12 @@ fn build_props(volume: f32, muted: bool) -> Result<Vec<u8>, Box<dyn Error>> {
     builder.add_prop(pw::spa::sys::SPA_PROP_softMute, 0)?;
     builder.add_bool(false)?;
     builder.add_prop(pw::spa::sys::SPA_PROP_softVolumes, 0)?;
-    // SAFETY: the unity values are contiguous F32 samples with a six-element count.
+    // SAFETY: the unity values are contiguous F32 samples with a layout-sized count.
     unsafe {
         builder.add_array(
             4,
             pw::spa::sys::SPA_TYPE_Float,
-            CHANNELS as u32,
+            soft_volumes.len() as u32,
             soft_volumes.as_ptr().cast(),
         )?;
         builder.pop(frame.assume_init_mut());

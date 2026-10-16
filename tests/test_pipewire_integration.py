@@ -114,27 +114,53 @@ def wait_until(predicate, timeout=4):
     return False
 
 
+def require_pipewire_test_environment():
+    required = ("pactl", "wpctl", "parec", "paplay")
+    if not os.path.isfile(AGENT):
+        raise unittest.SkipTest("build avr-volume-agent first with `cargo build`")
+    if any(shutil.which(tool) is None for tool in required):
+        raise unittest.SkipTest("PipeWire Pulse tools are not installed")
+    try:
+        pactl("info")
+    except subprocess.CalledProcessError:
+        raise unittest.SkipTest("no PipeWire-Pulse server is available")
+
+
+def start_agent(sink_name, node_name, avr):
+    env = os.environ.copy()
+    env.setdefault("RUST_LOG", "debug")
+    return subprocess.Popen(
+        [AGENT, "--target-sink", sink_name,
+         "--avr-host", "127.0.0.1", "--port", str(avr.server_address[1]),
+         "--node-name", node_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+
+
 def sink_info(name):
     sinks = json.loads(pactl("--format=json", "list", "sinks"))
     return next((sink for sink in sinks if sink["name"] == name), None)
 
 
-def monitor_rms(source, sink):
+def monitor_rms(source, sink, channels=6):
     frames = 24000
     tone = b"".join(
         struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * frame / 48000)))
-        * 6
+        * channels
         for frame in range(frames)
     )
     capture = subprocess.Popen(
         ["parec", f"--device={source}", "--raw", "--format=s16le",
-         "--rate=48000", "--channels=6"],
+         "--rate=48000", f"--channels={channels}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
     player = subprocess.Popen(
         ["paplay", f"--device={sink}", "--raw", "--format=s16le",
-         "--rate=48000", "--channels=6"],
+         "--rate=48000", f"--channels={channels}"],
         stdin=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
@@ -169,15 +195,7 @@ def monitor_rms(source, sink):
 class PipeWireIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        required = ("pactl", "wpctl", "parec", "paplay")
-        if not os.path.isfile(AGENT):
-            raise unittest.SkipTest("build avr-volume-agent first with `cargo build`")
-        if any(shutil.which(tool) is None for tool in required):
-            raise unittest.SkipTest("PipeWire Pulse tools are not installed")
-        try:
-            pactl("info")
-        except subprocess.CalledProcessError:
-            raise unittest.SkipTest("no PipeWire-Pulse server is available")
+        require_pipewire_test_environment()
 
     def setUp(self):
         self.sink_name = f"avrtest_{os.getpid()}"
@@ -192,15 +210,8 @@ class PipeWireIntegrationTest(unittest.TestCase):
             "rate=48000", "format=float32le",
         )
         self.avr = MockDenonServer()
-        self.agent = subprocess.Popen(
-            [AGENT, "--target-sink", self.sink_name,
-             "--avr-host", "127.0.0.1", "--port", str(self.avr.server_address[1]),
-             "--node-name", self.node_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if not wait_until(lambda: sink_info(self.node_name) is not None):
+        self.agent = start_agent(self.sink_name, self.node_name, self.avr)
+        if not wait_until(lambda: sink_info(self.node_name) is not None, timeout=20):
             log = self._stop_agent()
             self.avr.close()
             pactl("unload-module", self.module_id)
@@ -215,11 +226,11 @@ class PipeWireIntegrationTest(unittest.TestCase):
         if self.agent.poll() is None:
             self.agent.terminate()
         try:
-            _, log = self.agent.communicate(timeout=4)
+            log, _ = self.agent.communicate(timeout=4)
         except subprocess.TimeoutExpired:
             self.agent.kill()
-            _, log = self.agent.communicate(timeout=2)
-        return log
+            log, _ = self.agent.communicate(timeout=2)
+        return f"exit={self.agent.returncode}\n{log}"
 
     def _wait_command(self, command):
         if not wait_until(lambda: command in self.avr.commands.snapshot()):
@@ -318,6 +329,112 @@ class PipeWireIntegrationTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: sink_info(self.node_name)["mute"]))
         new_commands = self.avr.commands.snapshot()[command_count:]
         self.assertNotIn("MUON", new_commands, f"external AVR mute was echoed: {new_commands}")
+
+
+class StereoTargetIntegrationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        require_pipewire_test_environment()
+
+    def setUp(self):
+        self.sink_name = f"avrtest_stereo_{os.getpid()}"
+        self.node_name = f"avr_volume_stereo_test_{os.getpid()}"
+        self.module_id = pactl(
+            "load-module", "module-null-sink", f"sink_name={self.sink_name}",
+            "channels=2", "channel_map=front-left,front-right",
+            # Deliberately differ from PipeWire's common 48 kHz default.
+            "rate=44100", "format=float32le",
+        )
+        self.avr = MockDenonServer()
+        self.agent = start_agent(self.sink_name, self.node_name, self.avr)
+        if not wait_until(lambda: sink_info(self.node_name) is not None, timeout=20):
+            log = self._stop_agent()
+            self.avr.close()
+            pactl("unload-module", self.module_id)
+            self.fail(f"stereo virtual sink did not register; agent output: {log}")
+
+    def tearDown(self):
+        self._stop_agent()
+        self.avr.close()
+        pactl("unload-module", self.module_id)
+
+    def _stop_agent(self):
+        if self.agent.poll() is None:
+            self.agent.terminate()
+        try:
+            log, _ = self.agent.communicate(timeout=4)
+        except subprocess.TimeoutExpired:
+            self.agent.kill()
+            log, _ = self.agent.communicate(timeout=2)
+        return f"exit={self.agent.returncode}\n{log}"
+
+    def _wait_command(self, command):
+        if not wait_until(lambda: command in self.avr.commands.snapshot()):
+            log = self._stop_agent()
+            self.fail(
+                f"AVR command was not sent: {command}; got "
+                f"{self.avr.commands.snapshot()}; agent log: {log}"
+            )
+
+    def _replace_target(self, sink_name, channels, channel_map, rate=48000):
+        self._stop_agent()
+        self.avr.close()
+        pactl("unload-module", self.module_id)
+
+        self.sink_name = sink_name
+        self.module_id = pactl(
+            "load-module", "module-null-sink", f"sink_name={self.sink_name}",
+            f"channels={channels}", f"channel_map={channel_map}",
+            f"rate={rate}", "format=float32le",
+        )
+        self.avr = MockDenonServer()
+        self.agent = start_agent(self.sink_name, self.node_name, self.avr)
+        if not wait_until(lambda: sink_info(self.node_name) is not None):
+            log = self._stop_agent()
+            self.avr.close()
+            pactl("unload-module", self.module_id)
+            self.fail(f"virtual sink did not register; agent output: {log}")
+
+    def test_virtual_sink_follows_stereo_target_layout(self):
+        target_info = sink_info(self.sink_name)
+        self.assertIn("44100Hz", target_info["sample_specification"])
+        info = sink_info(self.node_name)
+        self.assertEqual(set(info["volume"]), {"front-left", "front-right"})
+        self.assertIn("44100Hz", info["sample_specification"])
+
+        self.assertTrue(wait_until(lambda: "MV?" in self.avr.commands.snapshot()))
+        self.assertTrue(wait_until(lambda: "MU?" in self.avr.commands.snapshot()))
+        time.sleep(1.1)
+        pactl("set-sink-volume", self.node_name, "10%")
+        self._wait_command("MV07")
+
+        rms = monitor_rms(f"{self.sink_name}.monitor", self.node_name, channels=2)
+        self.assertGreater(rms, 1000)
+
+    def test_virtual_sink_follows_seven_one_target_layout(self):
+        self._replace_target(
+            f"avrtest_71_{os.getpid()}",
+            8,
+            "front-left,front-right,front-center,lfe,side-left,side-right,rear-left,rear-right",
+        )
+        info = sink_info(self.node_name)
+        self.assertIn("48000Hz", info["sample_specification"])
+        self.assertEqual(
+            set(info["volume"]),
+            {
+                "front-left", "front-right", "front-center", "lfe",
+                "side-left", "side-right", "rear-left", "rear-right",
+            },
+        )
+
+        self.assertTrue(wait_until(lambda: "MV?" in self.avr.commands.snapshot()))
+        self.assertTrue(wait_until(lambda: "MU?" in self.avr.commands.snapshot()))
+        time.sleep(1.1)
+        pactl("set-sink-volume", self.node_name, "10%")
+        self._wait_command("MV07")
+
+        rms = monitor_rms(f"{self.sink_name}.monitor", self.node_name, channels=8)
+        self.assertGreater(rms, 1000)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,7 @@
+//! Owns the blocking AVR TCP connection on a worker thread.
+//! Keeping socket I/O out of PipeWire callbacks protects the audio loop, while
+//! a single owner serializes commands and coalesces rapid slider changes.
+
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -12,6 +16,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const IO_TIMEOUT: Duration = Duration::from_millis(100);
 const QUERY_INTERVAL: Duration = Duration::from_secs(30);
 const INITIAL_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+// If no matching reply arrives, a fresh query eventually makes receiver state authoritative.
+const COMMAND_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
@@ -35,19 +41,21 @@ pub struct NetworkEvent {
 
 #[derive(Clone, Copy)]
 struct Pending<T> {
+    // Denon replies contain values, not request IDs; this is the only available
+    // acknowledgement key for deciding whether a report belongs to our write.
     target: T,
     sent_at: Instant,
 }
 
 #[derive(Default)]
 struct DesiredState {
+    // Keep the latest local intent separately from reported state so an old AVR
+    // echo cannot replace a newer slider value while a command is in flight.
     volume: Option<i32>,
     volume_is_local: bool,
     mute: Option<bool>,
     mute_is_local: bool,
 }
-
-const COMMAND_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub fn spawn(
     config: NetworkConfig,
@@ -65,6 +73,8 @@ fn run(
     command_receiver: Receiver<NetworkCommand>,
     event_sender: Sender<NetworkEvent>,
 ) {
+    // Retain the latest local intent across reconnects; after the receiver's
+    // initial report, only the still-different value is replayed.
     let mut backoff = Duration::from_millis(250);
     let maximum_backoff = Duration::from_secs(10);
     let mut desired = DesiredState::default();
@@ -91,6 +101,8 @@ fn run(
 
                 info!(host = %config.host, port = config.port, "connected to AVR");
                 backoff = Duration::from_millis(250);
+                // Each new socket needs a fresh receiver snapshot before local
+                // intent can be reconciled or a queued command can be replayed.
                 let disconnected = run_connected(
                     &config,
                     &command_receiver,
@@ -211,6 +223,8 @@ fn run_connected(
             Err(error) => return Some(error),
         }
 
+        // Some receivers omit one field from their initial burst. A partial
+        // volume/max snapshot is enough to expose the sink after a short grace.
         if !state.ready
             && connected_at.elapsed() >= INITIAL_STATUS_TIMEOUT
             && state
@@ -277,6 +291,8 @@ fn sync_initial_state(
     desired: &mut DesiredState,
     event_sender: &Sender<NetworkEvent>,
 ) -> Option<io::Error> {
+    // A reconnect must not overwrite a pending desktop intent with stale AVR
+    // state; equal values acknowledge it, while differing values are resent.
     let mut changed = StatusFields::default();
     if state.seen.contains(StatusFields::MAX_VOLUME) {
         changed = changed | StatusFields::MAX_VOLUME;
@@ -413,6 +429,8 @@ fn accept_volume_report(
     desired: &mut DesiredState,
     pending: &mut Option<Pending<i32>>,
 ) -> Result<bool, io::Error> {
+    // Serialize volume writes: the AVR protocol has no request ID, so only a
+    // matching report can acknowledge the in-flight target without ambiguity.
     if let Some(in_flight) = *pending {
         if in_flight.target == reported {
             *pending = None;
